@@ -1,0 +1,81 @@
+# This manifest is written to satisfy the Kyverno policies in
+# policies/kyverno/*.yaml — see policies/kyverno/tests/ for the paired
+# `kyverno test` fixtures proving both this manifest (pass) and a naive
+# unhardened version (fail) behave as expected under those policies.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: accounts-api
+  namespace: accounts-api
+  labels:
+    app: accounts-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: accounts-api
+  template:
+    metadata:
+      labels:
+        app: accounts-api
+    spec:
+      serviceAccountName: accounts-api
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: accounts-api
+          # Digest-pinned, not `:latest` — Kyverno's disallow-latest-tag
+          # rule (restrict-pod-security.yaml) enforces this at admission too.
+          image: ghcr.io/example-org/accounts-api@sha256:REPLACE_WITH_BUILD_DIGEST
+          ports:
+            - containerPort: 8080
+              name: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            # Secrets are mounted, never passed as env vars (T7). This
+            # assumes the AWS Secrets and Configuration Provider (ASCP) for
+            # the Secrets Store CSI Driver is installed cluster-wide by the
+            # platform team — documented, not deployed live, per assessment
+            # scope (no real AWS account required).
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: accounts-api-secrets

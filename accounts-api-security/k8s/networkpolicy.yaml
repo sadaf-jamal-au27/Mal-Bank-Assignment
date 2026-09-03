@@ -1,0 +1,60 @@
+# Threat mapping: T5 (east-west blast radius on a shared cluster), T8
+# (egress scoping to the one KYC provider + RDS + DNS only).
+# Assumption: ingress-nginx/ALB controller runs in namespace
+# `ingress-controller` with label kubernetes.io/metadata.name=ingress-controller
+# — adjust the podSelector/namespaceSelector to match the real controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: accounts-api
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: accounts-api-allow
+  namespace: accounts-api
+spec:
+  podSelector:
+    matchLabels:
+      app: accounts-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-controller
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # RDS (Postgres) — replace CIDR with the actual RDS subnet range.
+    - to:
+        - ipBlock:
+            cidr: 10.0.16.0/20
+      ports:
+        - protocol: TCP
+          port: 5432
+    # KYC provider over the public internet — CIDR block is a placeholder;
+    # see DECISIONS.md §5 for why FQDN-based filtering isn't used here and
+    # what the accepted residual gap and compensating control are.
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24
+      ports:
+        - protocol: TCP
+          port: 443

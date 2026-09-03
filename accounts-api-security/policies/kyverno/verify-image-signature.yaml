@@ -1,0 +1,37 @@
+# Threat mapping: T3. This is the single control the decisions doc names as
+# the highest-leverage one in the whole build: it's the only check that
+# can't be bypassed by a fast-moving PR, because it runs at admission time
+# against the cluster's own trust policy, not in a step someone could skip.
+#
+# Keyless verification against the GitHub Actions OIDC identity that
+# produced the image in ci/.github/workflows/build.yml — this ties the
+# cluster's trust directly to "built by our CI, on our main branch",
+# without a long-lived signing key that itself becomes a secret to protect.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: accounts-api-verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-cosign-keyless-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/example-org/accounts-api*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/example-org/accounts-api/.github/workflows/build.yml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+          mutateDigest: true
+          required: true

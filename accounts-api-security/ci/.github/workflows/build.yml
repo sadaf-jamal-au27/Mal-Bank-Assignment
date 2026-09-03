@@ -1,0 +1,138 @@
+# One pipeline, staged so a failure in an earlier stage never lets a later
+# stage push/deploy — each job's `needs:` chains it after the scan that
+# threat-models it. See docs/DECISIONS.md §1 for why these are blocking,
+# not advisory, and why Semgrep/SAST is deliberately not in this file.
+name: build-and-secure
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write   # required for GitHub OIDC -> AWS / cosign keyless
+
+env:
+  IMAGE: ghcr.io/example-org/accounts-api
+
+jobs:
+  # --- T2: secrets never reach the repo in the first place ---
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Fails the job (default) on any finding — no baseline suppression
+        # file checked in; exceptions are handled via inline allowlist
+        # comments reviewed in PR, not a blanket ignore list.
+
+  # --- T9: IaC misconfiguration caught before merge, not after `apply` ---
+  terraform-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: terraform fmt -check
+        run: terraform -chdir=terraform fmt -check -recursive
+      - name: terraform init (no backend, validate only)
+        run: terraform -chdir=terraform init -backend=false
+      - name: terraform validate
+        run: terraform -chdir=terraform validate
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: false   # blocking on HIGH/CRITICAL by default policy set
+
+  # --- T4/T5: policy-as-code checked against the manifests in this repo ---
+  kyverno-policy-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kyverno CLI
+        run: |
+          curl -sL -o kyverno.tar.gz https://github.com/kyverno/kyverno/releases/download/v1.12.6/kyverno-cli_v1.12.6_linux_x86_64.tar.gz
+          tar xzf kyverno.tar.gz
+          sudo mv kyverno /usr/local/bin/
+      - name: kyverno test
+        run: kyverno test policies/kyverno/tests
+
+  # --- T1: build, scan, SBOM. Only runs after the checks above pass. ---
+  build-scan-sign:
+    needs: [gitleaks, terraform-checks, kyverno-policy-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t ${{ env.IMAGE }}:${{ github.sha }} .
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false
+          trivyignores: .trivyignore   # entries require expiry + ticket, see .trivyignore
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      - name: Log in to registry
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: docker push ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Install cosign
+        if: github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: identity is this workflow's own GitHub OIDC token,
+      # verified by Kyverno's verify-image-signature.yaml against exactly
+      # this repo + this workflow + refs/heads/main. No signing key to
+      # manage, rotate, or leak (T3).
+      - name: Sign image (cosign keyless)
+        if: github.ref == 'refs/heads/main'
+        run: cosign sign --yes ${{ env.IMAGE }}:${{ github.sha }}
+
+  # --- deploy stage: intentionally the last, thinnest job. Everything that ---
+  # --- can go wrong has already been asked to fail loudly before this runs ---
+  deploy:
+    needs: [build-scan-sign]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (OIDC, no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/accounts-api-gha-deploy
+          aws-region: ap-south-1
+      - name: Deploy (documented, not executed against a real cluster here)
+        run: |
+          echo "kubectl set image deployment/accounts-api accounts-api=${{ env.IMAGE }}:${{ github.sha }} -n accounts-api"
+          echo "This step is where kubectl/kustomize/helm would run against the real EKS cluster."
+          echo "Kyverno's verifyImages admission policy is what actually gates this — even a"
+          echo "compromised deploy step cannot get an unsigned image running."

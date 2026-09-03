@@ -1,0 +1,39 @@
+# Threat mapping: T10, the last line of defense after every admission-time
+# and pipeline control has already failed. Deliberately just two rules —
+# see docs/DECISIONS.md §6 for why a small, precisely-targeted ruleset beats
+# a large untuned default set for a 2-person platform team.
+
+- rule: Shell Spawned in accounts-api Container
+  desc: >
+    An interactive shell was spawned inside the accounts-api container.
+    This service is a stateless HTTP API with no operational reason to
+    exec a shell at runtime — this is a strong compromise indicator.
+  condition: >
+    spawned_process
+    and container
+    and k8s.ns.name = "accounts-api"
+    and proc.name in (shell_binaries)
+  output: >
+    Shell spawned in accounts-api container
+    (user=%user.name container=%container.name image=%container.image.repository
+    command=%proc.cmdline parent=%proc.pname)
+  priority: CRITICAL
+  tags: [accounts-api, T10, shell, mitre_execution]
+
+- rule: Unexpected Outbound Connection from accounts-api
+  desc: >
+    accounts-api opened an outbound connection to a destination port
+    outside its documented allowlist (443 to the KYC provider, 5432 to
+    RDS). NetworkPolicy (T5/T8) should already block this at the CNI
+    layer — this rule exists as defense-in-depth in case NetworkPolicy is
+    misconfigured, unsupported by the CNI, or bypassed.
+  condition: >
+    outbound
+    and container
+    and k8s.ns.name = "accounts-api"
+    and not fd.sport in (443, 5432)
+  output: >
+    Unexpected outbound connection from accounts-api
+    (command=%proc.cmdline connection=%fd.name container=%container.name)
+  priority: WARNING
+  tags: [accounts-api, T5, T8, network, mitre_exfiltration]

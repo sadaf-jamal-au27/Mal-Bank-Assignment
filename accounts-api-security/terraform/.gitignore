@@ -1,0 +1,36 @@
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files — never commit state; it can contain secret values in plain text
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# terraform.tfvars / *.auto.tfvars files — likely to contain sensitive data
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Override files — used for local dev overrides, should not be committed
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Lock file — commit this normally, but excluded here if you regenerate
+# providers locally on a different OS/arch than CI
+# .terraform.lock.hcl
+
+# Plan output files — may contain sensitive data
+*.tfplan
+*.plan
+
+# macOS
+.DS_Store

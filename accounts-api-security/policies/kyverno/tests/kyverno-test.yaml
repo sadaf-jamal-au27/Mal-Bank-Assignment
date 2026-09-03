@@ -1,0 +1,76 @@
+name: accounts-api-pod-security-tests
+policies:
+  - ../restrict-pod-security.yaml
+resources:
+  - resources.yaml
+results:
+  - policy: accounts-api-restrict-pod-security
+    rule: require-run-as-non-root
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: require-run-as-non-root
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail
+  - policy: accounts-api-restrict-pod-security
+    rule: disallow-privileged-and-escalation
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: disallow-privileged-and-escalation
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail
+  - policy: accounts-api-restrict-pod-security
+    rule: require-drop-all-capabilities
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: require-drop-all-capabilities
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail
+  - policy: accounts-api-restrict-pod-security
+    rule: require-readonly-root-filesystem
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: require-readonly-root-filesystem
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail
+  - policy: accounts-api-restrict-pod-security
+    rule: disallow-host-namespaces-and-hostpath
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: disallow-host-namespaces-and-hostpath
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail
+  - policy: accounts-api-restrict-pod-security
+    rule: require-resource-limits
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: require-resource-limits
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail
+  - policy: accounts-api-restrict-pod-security
+    rule: disallow-latest-tag
+    resource: accounts-api-compliant
+    kind: Pod
+    result: pass
+  - policy: accounts-api-restrict-pod-security
+    rule: disallow-latest-tag
+    resource: accounts-api-noncompliant
+    kind: Pod
+    result: fail

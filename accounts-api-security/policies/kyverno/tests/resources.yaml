@@ -1,0 +1,60 @@
+# Two fixtures: one that must PASS every rule in restrict-pod-security.yaml,
+# one that must FAIL every rule. `kyverno test .` (run from policies/kyverno/)
+# asserts both outcomes — see README.md.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: accounts-api-compliant
+  namespace: accounts-api
+  labels:
+    app: accounts-api
+spec:
+  serviceAccountName: accounts-api
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+  containers:
+    - name: accounts-api
+      image: ghcr.io/example-org/accounts-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: accounts-api-noncompliant
+  namespace: accounts-api
+  labels:
+    app: accounts-api
+spec:
+  serviceAccountName: accounts-api
+  hostNetwork: true
+  containers:
+    - name: accounts-api
+      image: ghcr.io/example-org/accounts-api:latest
+      securityContext:
+        privileged: true
+        allowPrivilegeEscalation: true
+        readOnlyRootFilesystem: false
+        runAsUser: 0
+      volumeMounts:
+        - name: hostfs
+          mountPath: /host
+  volumes:
+    - name: hostfs
+      hostPath:
+        path: /

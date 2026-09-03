@@ -1,0 +1,126 @@
+# Threat mapping: T4. Enforced, not audit-only — validationFailureAction:
+# Enforce means a non-compliant pod is rejected at admission, not merely
+# logged. Scoped to the accounts-api namespace only, deliberately: this repo
+# doesn't own the other ~12 teams' workloads on the shared cluster and
+# shouldn't silently start enforcing policy on them.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: accounts-api-restrict-pod-security
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "Containers must set runAsNonRoot: true and must not run as root (UID 0)."
+        pattern:
+          spec:
+            =(securityContext):
+              runAsNonRoot: true
+            containers:
+              - name: "*"
+                =(securityContext):
+                  =(runAsUser): "!0"
+
+    - name: disallow-privileged-and-escalation
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "privileged containers and privilege escalation are not allowed."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                securityContext:
+                  privileged: false
+                  allowPrivilegeEscalation: false
+
+    - name: require-drop-all-capabilities
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "Containers must drop ALL capabilities. Add back only what is explicitly justified."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                securityContext:
+                  capabilities:
+                    drop: ["ALL"]
+
+    - name: require-readonly-root-filesystem
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "Containers must set readOnlyRootFilesystem: true; use an emptyDir volume for any writable path."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                securityContext:
+                  readOnlyRootFilesystem: true
+
+    - name: disallow-host-namespaces-and-hostpath
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "hostPath volumes and host namespaces (hostNetwork/hostPID/hostIPC) are not allowed."
+        pattern:
+          spec:
+            =(hostNetwork): false
+            =(hostPID): false
+            =(hostIPC): false
+            =(volumes):
+              - X(hostPath): "null"
+
+    - name: require-resource-limits
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "Every container must declare CPU and memory limits, to bound a single compromised/runaway pod's impact on shared cluster capacity."
+        pattern:
+          spec:
+            containers:
+              - name: "*"
+                resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+
+    - name: disallow-latest-tag
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["accounts-api"]
+      validate:
+        message: "Images must be pinned by digest or an explicit non-latest tag, so what's running is always traceable back to a specific build."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: AnyIn
+                    value: ["*:latest"]

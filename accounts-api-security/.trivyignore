@@ -1,0 +1,5 @@
+# Format enforced by convention (checked by a reviewer, not by tooling in
+# this 4-hour scope): every entry needs an expiry date and a ticket link.
+# CI does not currently auto-fail on expiry (documented as a follow-on in
+# DECISIONS.md) — but an empty file is the honest starting state; no CVEs
+# are pre-suppressed here.

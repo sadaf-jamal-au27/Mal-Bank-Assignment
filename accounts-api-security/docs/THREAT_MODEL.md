@@ -1,41 +1,53 @@
 # Threat Model — `accounts-api`
 
-## Assumptions (stated, not asked)
-1. Cluster runs a recent Kubernetes version with Pod Security Admission available (assume EKS 1.28+, `restricted` PSA achievable).
-2. `accounts-api` terminates TLS at ALB/CloudFront; pod-to-pod traffic inside the cluster is plaintext HTTP unless stated. This is treated as an accepted gap, compensated by NetworkPolicy rather than mTLS, since no service mesh is assumed present.
-3. RDS Postgres holds name, email, phone, IBAN, balance, card last-4. IBAN + audit trail is regulated PII, so it is treated as "regulated data" for scoping, though last-4 alone does not put the full PAN in scope — full PCI-DSS CDE segmentation is explicitly not claimed.
-4. The third-party KYC provider is called over the public internet from inside the pod network — this is the primary egress control point.
-5. GitHub Actions is the only CI/CD path into the AWS org; ~40 people can merge, only 2 are platform engineers. Controls must live in the pipeline/policy layer, not in reviewer trust.
-6. No dedicated security team, so controls must be self-service, low-maintenance, and fail closed by default (deny unsigned images, deny root, etc.) rather than depend on a manual review gate.
-7. AWS service names are used for scope; the control described is what actually enforces the behaviour locally. See the mapping table in `README.md`.
+## Trust boundaries
 
-## Assets
-| Asset | Why it matters |
-|---|---|
-| Customer PII + IBAN + balance (in RDS, in transit, in logs) | Regulatory data; direct fraud/privacy impact |
-| KYC provider credential | Compromise lets an attacker impersonate the bank to a regulated KYC partner |
-| DB credentials | Compromise gives full read/write of customer financial data |
-| Container image / supply chain (source → registry → cluster) | Single choke point touched by 40 engineers; compromise here beats every downstream control |
-| Cluster/namespace boundary (shared with ~12 other teams) | Blast-radius control — accounts-api must not be pivotable to or from neighbours |
-| CI/CD identity (GitHub Actions → AWS) | Broadest privileged path into the org; an OIDC trust misconfiguration is an account-takeover primitive |
-| Audit trail written from the event stream | Its integrity is itself something other controls get examined against |
+```mermaid
+flowchart LR
+    subgraph Internet
+        User[Customer / API caller]
+        KYC[3rd-party KYC provider]
+    end
+    subgraph Edge["AWS edge (outside this repo's scope)"]
+        CF[CloudFront] --> ALB
+    end
+    subgraph EKS["Shared EKS cluster — ~12 other teams' pods live here too"]
+        ALB --> Pod[accounts-api pod]
+        Neighbor[Other teams' pods] -. lateral movement .-> Pod
+    end
+    subgraph AWSAcct["AWS account boundary"]
+        Pod -->|IRSA, scoped| SM[Secrets Manager]
+        Pod --> RDS[(RDS Postgres)]
+        Pod --> Stream[Event stream]
+        SM --> KMS
+    end
+    subgraph CI["GitHub — 40 engineers can merge"]
+        Dev[Any of 40 devs] --> Repo[accounts-api repo]
+        Repo --> GHA[GitHub Actions]
+    end
+    GHA -->|OIDC, scoped to main| AWSAcct
+    Pod --> KYC
+    User --> CF
+```
 
-## STRIDE-lite, scoped to what's actually in this repo
+Five boundaries matter: (1) public internet -> edge, (2) edge -> shared cluster, (3) inside the cluster, accounts-api's pod vs. everyone else's, (4) pod -> AWS account (IAM), (5) any of 40 engineers -> the pipeline that reaches production.
 
-| # | Threat | STRIDE | Vector | Control built | Where |
-|---|---|---|---|---|---|
-| T1 | Vulnerable/malicious dependency or base image reaches prod | Tampering | 40 mergers, no security team gate | Trivy image scan + Syft SBOM in CI; fails on HIGH/CRITICAL, with a time-boxed, expiring `.trivyignore` for no-fix-available CVEs | `ci/.github/workflows/build.yml` |
-| T2 | Secret committed to git (DB creds, KYC key) | Info disclosure | Fast-moving repo, 40 mergers | Gitleaks scan, blocking on push/PR | `ci/.github/workflows/build.yml` |
-| T3 | Unsigned/tampered image deployed, or a neighbour's pipeline pushes into the same registry namespace | Tampering, Spoofing | Shared registry, shared cluster | Cosign keyless sign in CI + Kyverno `verifyImages` admission policy — cluster refuses any image without a valid signature from the expected CI identity | `ci/.github/workflows/build.yml`, `policies/kyverno/verify-image-signature.yaml` |
-| T4 | Pod runs as root/privileged, escapes to node, pivots to a neighbour team's workload | Elevation of privilege | Shared EKS cluster | Kyverno: deny privileged/root, drop ALL capabilities, read-only root FS, deny hostPath/hostNetwork/hostPID | `policies/kyverno/restrict-pod-security.yaml` |
-| T5 | East-west movement: a compromised neighbour reaches accounts-api's DB path, or accounts-api reaches something it shouldn't | Spoofing, Tampering | Shared cluster, flat network by default | Default-deny NetworkPolicy + explicit allow: ingress only from the ingress controller, egress only to RDS CIDR, KYC provider, and DNS | `k8s/networkpolicy.yaml` |
-| T6 | Over-privileged pod IAM identity used for lateral movement into other AWS accounts in the org | Elevation of privilege | Multi-account org, IRSA | IRSA role in Terraform scoped to the specific RDS secret ARN, KMS key, and Secrets Manager path only — no `*` resource | `terraform/iam.tf` |
-| T7 | DB/API credentials handled as plain env vars or baked into the image | Info disclosure | Regulated data | No secret material in manifests or image; pod fetches at runtime via IRSA → Secrets Manager (CSI secret-store pattern documented); CI never sees the runtime secret | `terraform/secrets.tf`, `docs/DECISIONS.md` |
-| T8 | Uncontrolled egress beyond the one KYC provider (exfiltration, C2) | Info disclosure, Tampering | The public internet call is a stated requirement, so egress can't be fully denied | NetworkPolicy scopes egress to DNS + RDS CIDR + KYC provider CIDR only. Residual gap: true FQDN-based L7 egress filtering needs a mesh/Cilium not assumed present — accepted, with flow-log/GuardDuty-equivalent alerting as compensating control | `k8s/networkpolicy.yaml`, `docs/DECISIONS.md` |
-| T9 | IaC drift/misconfiguration (public RDS, open SG, unencrypted storage) | Tampering | 2-person platform team, no dedicated reviewer | Checkov in CI on every `terraform plan`; blocks on HIGH | `ci/.github/workflows/build.yml` |
-| T10 | Runtime anomaly after every prior control fails (shell exec, crypto-miner, unexpected outbound) | Elevation of privilege | Defense in depth | One Falco rule: alert on shell exec inside the accounts-api container and unexpected outbound to non-allowlisted ports | `falco/accounts-api-rules.yaml` |
+## Top 5 threats, ranked by how likely they are to actually happen here
 
-## Explicitly out of scope, and why
-- **Service mesh / mTLS** — the technically correct answer for T5 at full zero-trust maturity, but standing up a mesh from scratch is disproportionate to a 4-hour scope and to a 2-person platform team's ongoing maintenance load. NetworkPolicy is the compensating control; mesh is flagged as a follow-on in the decisions doc.
-- **WAF/CloudFront rule tuning** — the edge is infrastructure outside this repo's stated boundary (the service + its pipeline + its identity/secrets); noted as an assumption, not built.
-- **Full PCI-DSS CDE segmentation** — only card last-4 is stored, so full PAN scope is not claimed.
+| # | Threat | Entry point | What's reached | Control in this submission / risk accepted |
+|---|---|---|---|---|
+| 1 | A bad or malicious merge (of 40 possible mergers, no security team) ships a vulnerable or tampered image | PR merge to `main` | Production pod with a live path to customer PII in RDS | **Built.** Trivy + Gitleaks + Checkov block the merge; Cosign signs the image; Kyverno `verifyImages` refuses any pod whose image isn't signed by this exact CI identity — so even a merge that slips past review can't reach a running pod unsigned. |
+| 2 | A secret (DB creds, KYC key) gets committed to git by one of 40 engineers | `git push` | Full repo history — readable by everyone with repo access, and by anyone if the repo or a fork ever leaks further | **Built.** Gitleaks blocks the push/PR. Also structural: no secret ever lives in a manifest, image, or env var — the pod fetches from Secrets Manager at runtime via IRSA, so there's nothing in the repo to leak in the first place. |
+| 3 | A compromised or careless workload from one of the ~12 other teams on the same cluster pivots into accounts-api's pod or its DB path | Neighbor team's pod, same cluster | accounts-api's network path to RDS, or the pod itself | **Built.** Default-deny NetworkPolicy (only the ingress controller and DNS/RDS/KYC egress are allowed) + PSA `restricted` + Kyverno pod hardening (no root, no privileged, no hostPath) — limits both what a neighbor can reach and what a compromised accounts-api pod itself could do to the node or to other tenants. |
+| 4 | After a container compromise (via #1 or #3), an over-permissioned IAM role is used to reach further into the AWS org | Compromised pod runtime | Other secrets, other accounts in the org, if the role is broad | **Built.** IRSA role scoped to exactly this service's own secret ARNs and KMS key — no wildcard resource anywhere. Caps the blast radius of #1/#3 even if they succeed. |
+| 5 | IaC misconfiguration (public RDS, open security group, unencrypted storage) shipped by a 2-person platform team with no dedicated reviewer | `terraform` merge | Direct data exposure, bypassing every application-layer control above | **Built.** Checkov blocks the CI job on `terraform plan`; KMS encryption is enforced at the key-policy level, not left to a checkbox on the RDS resource. |
+
+## What I'm not spending budget on, and why
+**Overrated in this context: a sophisticated external network attack directly against CloudFront/ALB** (DDoS, L7 exploits, TLS downgrade). This is where most take-home submissions over-invest — WAF rule tuning, rate limiting, edge hardening — but it's already the most externally-hardened, most mature layer in a real AWS setup (managed services, Shield, standard WAF managed rule groups), and it isn't this system's actual weak point. Given 40 mergers with no security team and a cluster shared with a dozen other tenants, the realistic breach path is internal — a bad merge, a leaked secret, a noisy neighbor — not a novel exploit against CloudFront. That's why the edge is named as an assumption and left alone, and the five threats above got the time instead.
+
+## Controls built beyond the top 5 (traceability for the rest of the submission)
+- **Egress scoping to the KYC provider specifically** (not just "default-deny") — not one of the top 5 on its own, but it's the cheapest possible narrowing of #3/#4's blast radius once a pod is compromised, so it rides along with the NetworkPolicy already built for #3.
+- **Falco runtime rule (shell exec, unexpected egress)** — doesn't map to a top-5 entry point; it's deliberately last-line-of-defense for the case where #1-#5 all fail anyway. One rule, not a ruleset, because a 2-person platform team can't tune more than that without alert fatigue.
+- **SBOM generation (Syft)** — not a control against a specific threat, it's an audit artifact a bank's examiner would ask for regardless of which of the five threats materialised.
+
+Full reasoning for every enforce/accept decision, including the ones deliberately left un-enforced, is in `docs/DECISIONS.md`.
